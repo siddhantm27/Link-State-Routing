@@ -1,307 +1,485 @@
+// Virtual Node.
+//
+// A VN learns only its own neighbours, from the Oracle Node over TCP. Everything
+// else about the network it discovers by flooding: it advertises its adjacencies
+// in a Link State Packet, forwards the LSPs it receives, and from the resulting
+// database computes shortest paths to every node it has heard of.
+//
+// Wire protocol, all integers network byte order:
+//
+//   CONNECT     VN -> ON   6 bytes    4 IP | 2 UDP port
+//   LINK-STATE  ON -> VN   11n bytes  per record: 1 letter | 4 IP | 2 port | 4 cost
+//   LSP         VN -> VN   6+5k bytes 1 origin | 4 seq | 1 count, then per link:
+//                                     1 letter | 4 cost
+//
+// In a LINK-STATE message the record with cost 0 is this node's own identity.
+// Link failure is not signalled explicitly: an LSP that stops being refreshed
+// ages out, and the topology it described disappears with it.
+
 #include <algorithm>
 #include <arpa/inet.h>
+#include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <iostream>
 #include <map>
-#include <netdb.h>
-#include <netinet/in.h>
+#include <queue>
 #include <set>
 #include <string>
 #include <sys/select.h>
 #include <sys/socket.h>
-#include <sys/time.h>
-#include <tuple>
 #include <unistd.h>
 #include <vector>
 
-using namespace std;
+namespace {
 
-const int LSP_PERIOD = 10;
-const int PRINT_PERIOD = 30;
+constexpr int kOraclePort = 5000;
+constexpr int kConnectLen = 6;
+constexpr int kRecordLen = 11;
+constexpr int kLspHeaderLen = 6;
+constexpr int kLspLinkLen = 5;
+constexpr size_t kMaxDatagram = 2048;
 
-void send_lsp(int udp_fd, char origin, uint32_t seq,
-              const map<char, int> &links,
-              const map<char, tuple<string, uint16_t, int>> &flood_to) {
-    char buf[1024];
-    buf[0] = origin;
-    uint32_t seq_net = htonl(seq);
-    memcpy(buf + 1, &seq_net, 4);
-    uint8_t num = links.size();
-    buf[5] = num;
-    int pos = 6;
-    vector<char> link_keys;
-    for (const auto &p : links)
-        link_keys.push_back(p.first);
-    sort(link_keys.begin(), link_keys.end());
-    for (char link_key : link_keys) {
-        buf[pos] = link_key;
-        pos++;
-        uint32_t cost_net = htonl(links.at(link_key));
-        memcpy(buf + pos, &cost_net, 4);
-        pos += 4;
+// Re-advertise our own LSP this often. A node that goes quiet for kLspTimeout is
+// treated as unreachable, so the timeout must clear several refresh periods to
+// avoid tearing down a path over one dropped datagram.
+constexpr auto kLspPeriod = std::chrono::seconds(10);
+constexpr auto kLspTimeout = std::chrono::seconds(35);
+constexpr auto kReportPeriod = std::chrono::seconds(30);
+
+// LSPs are flooded unreliably, so send each one a few times.
+constexpr int kFloodRepeats = 3;
+
+using Clock = std::chrono::steady_clock;
+
+struct Neighbour {
+    std::string ip;
+    uint16_t port = 0;
+    int cost = 0;
+
+    bool operator==(const Neighbour &o) const {
+        return ip == o.ip && port == o.port && cost == o.cost;
     }
-    for (const auto &p : flood_to) {
-        char neigh = p.first;
-        int cost = get<2>(p.second);
-        if (cost == 0)
-            continue;
-        string ip = get<0>(p.second);
-        uint16_t port = get<1>(p.second);
-        struct sockaddr_in dest;
-        memset(&dest, 0, sizeof(dest));
-        dest.sin_family = AF_INET;
-        dest.sin_port = htons(port);
-        inet_pton(AF_INET, ip.c_str(), &dest.sin_addr);
-        for (int times = 0; times < 3; ++times)
-            sendto(udp_fd, buf, pos, 0, (struct sockaddr *)&dest, sizeof(dest));
+    bool operator!=(const Neighbour &o) const { return !(*this == o); }
+};
+
+struct LinkState {
+    uint32_t seq = 0;
+    std::map<char, int> links;
+    Clock::time_point heard;
+};
+
+struct Route {
+    int cost;
+    char next_hop;
+
+    bool operator==(const Route &o) const {
+        return cost == o.cost && next_hop == o.next_hop;
     }
+    bool operator!=(const Route &o) const { return !(*this == o); }
+};
+
+bool set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
-void print_graph(const map<char, pair<uint32_t, map<char, int>>> &lsps) {
-    set<char> all_nodes;
-    for (const auto &p : lsps) {
-        all_nodes.insert(p.first);
-        for (const auto &q : p.second.second)
-            all_nodes.insert(q.first);
-    }
-    vector<char> sorted_nodes(all_nodes.begin(), all_nodes.end());
-    map<char, int> node_idx;
-    for (size_t i = 0; i < sorted_nodes.size(); ++i)
-        node_idx[sorted_nodes[i]] = i;
-    int m = sorted_nodes.size();
-    vector<vector<int>> adj_matrix(m, vector<int>(m, -1));
-    for (const auto &p : lsps) {
-        int src = node_idx[p.first];
-        for (const auto &q : p.second.second) {
-            int dst = node_idx[q.first];
-            adj_matrix[src][dst] = q.second;
-            adj_matrix[dst][src] = q.second;
+// ---------------------------------------------------------------- shortest path
+
+// Dijkstra over the flooded link state database. Returns, for every reachable
+// node, its total cost and the neighbour to hand the packet to first.
+//
+// The database is built from advertisements that are not necessarily mutually
+// consistent: a node may still be advertising a link its far end has already
+// withdrawn. A link is therefore only usable when both endpoints advertise it,
+// which keeps a half-torn-down link out of the routing table.
+std::map<char, Route> shortest_paths(char self,
+                                     const std::map<char, LinkState> &db) {
+    auto advertised = [&db](char from, char to) -> const int * {
+        auto it = db.find(from);
+        if (it == db.end())
+            return nullptr;
+        auto link = it->second.links.find(to);
+        return link == it->second.links.end() ? nullptr : &link->second;
+    };
+
+    struct Entry {
+        int cost;
+        char node;
+        char first_hop;
+        bool operator>(const Entry &o) const { return cost > o.cost; }
+    };
+
+    std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> frontier;
+    std::map<char, Route> routes;
+
+    frontier.push({0, self, 0});
+    while (!frontier.empty()) {
+        Entry cur = frontier.top();
+        frontier.pop();
+        if (routes.count(cur.node))
+            continue;
+        if (cur.node != self)
+            routes[cur.node] = {cur.cost, cur.first_hop};
+
+        auto it = db.find(cur.node);
+        if (it == db.end())
+            continue;
+        for (const auto &[peer, cost] : it->second.links) {
+            if (routes.count(peer))
+                continue;
+            const int *reverse = advertised(peer, cur.node);
+            if (reverse == nullptr)
+                continue; // only one end still claims this link
+            // Disagreeing costs are possible mid-convergence; the higher one is
+            // the safe choice, since it never makes a path look better than it is.
+            int edge = std::max(cost, *reverse);
+            char first = (cur.node == self) ? peer : cur.first_hop;
+            frontier.push({cur.cost + edge, peer, first});
         }
     }
-    cout<< "Current network topology:" << endl;
-    for (int i = 0; i < m; ++i) {
-        string line;
-        for (int k = 0; k < i; ++k)
-            line += " ";
-        for (int j = i + 1; j < m; ++j)
-            line += to_string(adj_matrix[i][j]) + " ";
-        cout << line << endl;
-    }
-    cout << "---------------------------------" << endl;
+    return routes;
 }
+
+void print_routes(char self, const std::map<char, Route> &routes) {
+    std::cout << "\n=== routing table for " << self << " ===\n";
+    if (routes.empty()) {
+        std::cout << "  (no reachable destinations)\n";
+    } else {
+        std::cout << "  dest  cost  via\n";
+        for (const auto &[dest, route] : routes)
+            std::cout << "   " << dest << "     " << route.cost << "     "
+                      << route.next_hop << "\n";
+    }
+    std::cout << std::flush;
+}
+
+void print_topology(const std::map<char, LinkState> &db) {
+    std::set<char> nodes;
+    for (const auto &[origin, ls] : db) {
+        nodes.insert(origin);
+        for (const auto &[peer, _] : ls.links)
+            nodes.insert(peer);
+    }
+    std::cout << "--- known topology (" << nodes.size() << " nodes) ---\n";
+    for (const auto &[origin, ls] : db) {
+        std::cout << "  " << origin << ":";
+        for (const auto &[peer, cost] : ls.links)
+            std::cout << " " << peer << "=" << cost;
+        std::cout << "\n";
+    }
+    std::cout << std::flush;
+}
+
+// ------------------------------------------------------------------- flooding
+
+// Serialise an LSP and send it to each of `targets`.
+void flood(int udp_fd, char origin, uint32_t seq,
+           const std::map<char, int> &links,
+           const std::map<char, Neighbour> &targets) {
+    std::vector<uint8_t> buf;
+    buf.reserve(kLspHeaderLen + links.size() * kLspLinkLen);
+
+    buf.push_back(static_cast<uint8_t>(origin));
+    uint32_t seq_net = htonl(seq);
+    const auto *seq_bytes = reinterpret_cast<const uint8_t *>(&seq_net);
+    buf.insert(buf.end(), seq_bytes, seq_bytes + 4);
+    buf.push_back(static_cast<uint8_t>(links.size()));
+
+    for (const auto &[peer, cost] : links) { // std::map iterates sorted
+        buf.push_back(static_cast<uint8_t>(peer));
+        uint32_t cost_net = htonl(static_cast<uint32_t>(cost));
+        const auto *cost_bytes = reinterpret_cast<const uint8_t *>(&cost_net);
+        buf.insert(buf.end(), cost_bytes, cost_bytes + 4);
+    }
+
+    for (const auto &[peer, info] : targets) {
+        if (info.cost == 0)
+            continue; // that record is ourselves
+        sockaddr_in dest{};
+        dest.sin_family = AF_INET;
+        dest.sin_port = htons(info.port);
+        if (inet_pton(AF_INET, info.ip.c_str(), &dest.sin_addr) != 1)
+            continue;
+        for (int i = 0; i < kFloodRepeats; ++i)
+            sendto(udp_fd, buf.data(), buf.size(), 0,
+                   reinterpret_cast<sockaddr *>(&dest), sizeof(dest));
+    }
+}
+
+} // namespace
 
 int main(int argc, char *argv[]) {
     if (argc != 4) {
-        cerr << "Usage: " << argv[0] << " <ON_IP> <VN_IP> <VN_UDP_port>"
-             << endl;
+        std::cerr << "usage: " << argv[0] << " <ON IP> <own IP> <own UDP port>\n";
+        return 1;
+    }
+    const char *oracle_ip = argv[1];
+    const char *own_ip = argv[2];
+    uint16_t own_port = 0;
+    try {
+        own_port = static_cast<uint16_t>(std::stoi(argv[3]));
+    } catch (const std::exception &) {
+        std::cerr << "bad UDP port: " << argv[3] << "\n";
         return 1;
     }
 
-    const char *on_ip = argv[1];
-    const char *vn_ip_str = argv[2];
-    uint16_t vn_udp_port = stoi(argv[3]);
-
-    // TCP socket
+    // ---- control channel to the Oracle Node
     int tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (tcp_fd < 0) {
-        cerr << "tcp socket error" << endl;
+        perror("tcp socket");
         return 1;
     }
-    struct sockaddr_in on_addr;
-    memset(&on_addr, 0, sizeof(on_addr));
-    on_addr.sin_family = AF_INET;
-    on_addr.sin_port = htons(5000);
-    if (inet_pton(AF_INET, on_ip, &on_addr.sin_addr) <= 0) {
-        cerr << "Invalid ON IP" << endl;
+    sockaddr_in oracle{};
+    oracle.sin_family = AF_INET;
+    oracle.sin_port = htons(kOraclePort);
+    if (inet_pton(AF_INET, oracle_ip, &oracle.sin_addr) != 1) {
+        std::cerr << "bad ON address: " << oracle_ip << "\n";
         return 1;
     }
-    if (connect(tcp_fd, (struct sockaddr *)&on_addr, sizeof(on_addr)) < 0) {
-        cerr << "connect" << endl;
+    if (connect(tcp_fd, reinterpret_cast<sockaddr *>(&oracle), sizeof(oracle)) < 0) {
+        perror("connect");
         close(tcp_fd);
         return 1;
     }
 
-    // Send CONNECT
-    struct in_addr vn_ip;
-    if (inet_pton(AF_INET, vn_ip_str, &vn_ip) <= 0) {
-        cerr << "Invalid own IP" << endl;
+    in_addr parsed_ip{};
+    if (inet_pton(AF_INET, own_ip, &parsed_ip) != 1) {
+        std::cerr << "bad own address: " << own_ip << "\n";
+        close(tcp_fd);
         return 1;
     }
-    uint16_t vn_port_net = htons(vn_udp_port);
-    char connect_msg[6];
-    memcpy(connect_msg, &vn_ip.s_addr, 4);
-    memcpy(connect_msg + 4, &vn_port_net, 2);
-    if (send(tcp_fd, connect_msg, 6, 0) != 6) {
-        cerr << "send connect" << endl;
+    uint8_t hello[kConnectLen];
+    std::memcpy(hello, &parsed_ip.s_addr, 4);
+    uint16_t port_net = htons(own_port);
+    std::memcpy(hello + 4, &port_net, 2);
+    if (send(tcp_fd, hello, sizeof(hello), 0) != kConnectLen) {
+        perror("send CONNECT");
+        close(tcp_fd);
         return 1;
     }
 
-    // State
-    char vn_alphabet = 0;
-    map<char, tuple<string, uint16_t, int>> neighbors;
-    map<char, pair<uint32_t, map<char, int>>> lsps;
-    uint32_t lsp_seq = 0;
-    int lsp_timer = 0;
-    int print_timer = 0;
-
-    // UDP socket
+    // ---- data channel for flooding
     int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_fd < 0) {
         perror("udp socket");
+        close(tcp_fd);
         return 1;
     }
-    struct sockaddr_in udp_addr;
-    memset(&udp_addr, 0, sizeof(udp_addr));
-    udp_addr.sin_family = AF_INET;
-    udp_addr.sin_addr.s_addr = INADDR_ANY;
-    udp_addr.sin_port = htons(vn_udp_port);
-    if (bind(udp_fd, (struct sockaddr *)&udp_addr, sizeof(udp_addr)) < 0) {
-        cerr << "bind udp" << endl;
+    sockaddr_in bind_addr{};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = INADDR_ANY;
+    bind_addr.sin_port = htons(own_port);
+    if (bind(udp_fd, reinterpret_cast<sockaddr *>(&bind_addr), sizeof(bind_addr)) < 0) {
+        perror("bind udp");
+        close(tcp_fd);
+        close(udp_fd);
+        return 1;
+    }
+    if (!set_nonblocking(tcp_fd) || !set_nonblocking(udp_fd)) {
+        perror("fcntl");
+        close(tcp_fd);
         close(udp_fd);
         return 1;
     }
 
-    while (true) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(tcp_fd, &readfds);
-        FD_SET(udp_fd, &readfds);
-        int nfds = max(tcp_fd, udp_fd) + 1;
-        struct timeval timeout = {1, 0};
-        int ret = select(nfds, &readfds, nullptr, nullptr, &timeout);
-        if (ret < 0) {
+    char self = 0;
+    uint32_t own_seq = 0;
+    std::map<char, Neighbour> neighbours;
+    std::map<char, LinkState> db;
+    std::map<char, Route> routes;
+
+    auto last_advert = Clock::now();
+    auto last_report = Clock::now();
+    bool running = true;
+
+    auto recompute = [&](const char *why) {
+        auto fresh = shortest_paths(self, db);
+        if (fresh != routes) {
+            routes = std::move(fresh);
+            std::cout << "[" << self << "] routes recomputed (" << why << ")\n";
+            print_routes(self, routes);
+        }
+    };
+
+    while (running) {
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(tcp_fd, &readable);
+        FD_SET(udp_fd, &readable);
+        timeval timeout{1, 0};
+
+        int ready = select(std::max(tcp_fd, udp_fd) + 1, &readable, nullptr,
+                           nullptr, &timeout);
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
             perror("select");
             break;
-        } else if (ret == 0) {
-            // timeout
-            lsp_timer++;
-            print_timer++;
-            if (lsp_timer >= LSP_PERIOD && vn_alphabet != 0) {
-                lsp_timer = 0;
-                auto &own_links = lsps[vn_alphabet].second;
-                send_lsp(udp_fd, vn_alphabet, lsp_seq, own_links, neighbors);
-            }
-            if (print_timer >= PRINT_PERIOD && vn_alphabet != 0) {
-                print_timer = 0;
-                print_graph(lsps);
-            }
-            continue;
         }
 
-        if (FD_ISSET(tcp_fd, &readfds)) {
-            char buffer[1024];
-            ssize_t bytes = recv(tcp_fd, buffer, sizeof(buffer), 0);
-            if (bytes == 0) {
-                cout << "ON closed" << endl;
+        // ---- topology from the Oracle Node
+        if (ready > 0 && FD_ISSET(tcp_fd, &readable)) {
+            uint8_t buf[kMaxDatagram];
+            ssize_t n = recv(tcp_fd, buf, sizeof(buf), 0);
+            if (n == 0) {
+                std::cout << "[vn] Oracle Node closed the connection\n";
                 break;
             }
-            if (bytes % 11 != 0) {
-                cerr << "Invalid LINK-STATE length" << endl;
-                continue;
-            }
-            map<char, tuple<string, uint16_t, int>> new_neigh_info;
-            char new_vn_alpha = 0;
-            for (ssize_t i = 0; i < bytes; i += 11) {
-                char alpha = buffer[i];
-                struct in_addr ip;
-                memcpy(&ip.s_addr, buffer + i + 1, 4);
-                char ip_str[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &ip, ip_str, sizeof(ip_str));
-                uint16_t port_net;
-                memcpy(&port_net, buffer + i + 5, 2);
-                uint16_t port = ntohs(port_net);
-                uint32_t cost_net;
-                memcpy(&cost_net, buffer + i + 7, 4);
-                int cost = ntohl(cost_net);
-                new_neigh_info[alpha] = make_tuple(string(ip_str), port, cost);
-                if (cost == 0)
-                    new_vn_alpha = alpha;
-            }
-            bool changed = (neighbors != new_neigh_info);
-            neighbors = new_neigh_info;
-            vn_alphabet = new_vn_alpha;
-
-            string neigh_info_str;
-            vector<char> neigh_alpha;
-            for (const auto &p : neighbors) {
-                int cost = get<2>(p.second);
-                if (cost == 0) {
-                    neigh_info_str += p.first;
-                    neigh_info_str += "=0,";
-                } else
-                    neigh_alpha.push_back(p.first);
-            }
-            sort(neigh_alpha.begin(), neigh_alpha.end());
-            for (char k : neigh_alpha) {
-                neigh_info_str += k;
-                neigh_info_str += "=" + to_string(get<2>(neighbors[k])) + ",";
-            }
-            if (!neigh_info_str.empty())
-                neigh_info_str.pop_back(); // remove comma
-            cout << neigh_info_str << endl;
-            if (changed) {
-                map<char, int> links;
-                for (const auto &p : neighbors) {
-                    int cost = get<2>(p.second);
-                    if (cost != 0)
-                        links[p.first] = cost;
+            if (n < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                    perror("recv tcp");
+                    break;
                 }
-                lsps[vn_alphabet] = make_pair(++lsp_seq, links);
-                send_lsp(udp_fd, vn_alphabet, lsp_seq, links, neighbors);
+            } else if (n % kRecordLen != 0) {
+                std::cerr << "[vn] malformed LINK-STATE (" << n << " bytes)\n";
+            } else {
+                std::map<char, Neighbour> fresh;
+                char identity = 0;
+                for (ssize_t off = 0; off < n; off += kRecordLen) {
+                    char letter = static_cast<char>(buf[off]);
+                    in_addr ip{};
+                    std::memcpy(&ip.s_addr, buf + off + 1, 4);
+                    char ip_str[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &ip, ip_str, sizeof(ip_str));
+                    uint16_t port_be;
+                    std::memcpy(&port_be, buf + off + 5, 2);
+                    uint32_t cost_be;
+                    std::memcpy(&cost_be, buf + off + 7, 4);
+
+                    Neighbour info;
+                    info.ip = ip_str;
+                    info.port = ntohs(port_be);
+                    info.cost = static_cast<int>(ntohl(cost_be));
+                    if (info.cost == 0)
+                        identity = letter;
+                    fresh[letter] = std::move(info);
+                }
+
+                bool changed = (fresh != neighbours);
+                neighbours = std::move(fresh);
+                if (identity != 0 && identity != self) {
+                    self = identity;
+                    std::cout << "[vn] Oracle Node assigned identity " << self << "\n";
+                }
+
+                if (changed && self != 0) {
+                    std::map<char, int> links;
+                    for (const auto &[letter, info] : neighbours)
+                        if (info.cost != 0)
+                            links[letter] = info.cost;
+
+                    std::cout << "[" << self << "] adjacency:";
+                    for (const auto &[letter, cost] : links)
+                        std::cout << " " << letter << "=" << cost;
+                    if (links.empty())
+                        std::cout << " (isolated)";
+                    std::cout << "\n";
+
+                    db[self] = {++own_seq, links, Clock::now()};
+                    flood(udp_fd, self, own_seq, links, neighbours);
+                    last_advert = Clock::now();
+                    recompute("local links changed");
+                }
             }
         }
 
-        if (FD_ISSET(udp_fd, &readfds)) {
-            char buffer[1024];
-            struct sockaddr_in src_addr;
-            socklen_t len = sizeof(src_addr);
-            ssize_t bytes = recvfrom(udp_fd, buffer, sizeof(buffer), 0,
-                                     (struct sockaddr *)&src_addr, &len);
-            if (bytes < 6)
-                continue;
-            char origin = buffer[0];
-            uint32_t seq_net;
-            memcpy(&seq_net, buffer + 1, 4);
-            uint32_t seq = ntohl(seq_net);
-            uint8_t origin_neigh_cnt = buffer[5];
-            if (6 + origin_neigh_cnt * 5 != static_cast<size_t>(bytes)) {
-                cerr << "Invalid LSP length" << endl;
-                continue;
-            }
-            map<char, int> origin_links;
-            for (uint8_t k = 0; k < origin_neigh_cnt; ++k) {
-                int off = 6 + k * 5;
-                char neigh = buffer[off];
-                uint32_t cost_net;
-                memcpy(&cost_net, buffer + off + 1, 4);
-                uint32_t cost = ntohl(cost_net);
-                origin_links[neigh] = cost;
-            }
-            auto it = lsps.find(origin);
-            if (it == lsps.end() || seq > it->second.first) {
-                lsps[origin] = make_pair(seq, origin_links);
-                char sender = 0;
-                char src_ip_str[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &src_addr.sin_addr, src_ip_str,
-                          sizeof(src_ip_str));
-                uint16_t src_port = ntohs(src_addr.sin_port);
-                for (const auto &p : neighbors) {
-                    if (get<2>(p.second) != 0 &&
-                        get<0>(p.second) == src_ip_str &&
-                        get<1>(p.second) == src_port) {
-                        sender = p.first;
-                        break;
+        // ---- LSPs from other nodes
+        if (ready > 0 && FD_ISSET(udp_fd, &readable)) {
+            uint8_t buf[kMaxDatagram];
+            sockaddr_in from{};
+            socklen_t from_len = sizeof(from);
+            ssize_t n = recvfrom(udp_fd, buf, sizeof(buf), 0,
+                                 reinterpret_cast<sockaddr *>(&from), &from_len);
+            if (n >= kLspHeaderLen) {
+                char origin = static_cast<char>(buf[0]);
+                uint32_t seq_be;
+                std::memcpy(&seq_be, buf + 1, 4);
+                uint32_t seq = ntohl(seq_be);
+                uint8_t count = buf[5];
+
+                if (kLspHeaderLen + count * kLspLinkLen != n) {
+                    std::cerr << "[vn] malformed LSP from " << origin << "\n";
+                } else if (origin != self) {
+                    std::map<char, int> links;
+                    for (uint8_t k = 0; k < count; ++k) {
+                        int off = kLspHeaderLen + k * kLspLinkLen;
+                        uint32_t cost_be;
+                        std::memcpy(&cost_be, buf + off + 1, 4);
+                        links[static_cast<char>(buf[off])] =
+                            static_cast<int>(ntohl(cost_be));
+                    }
+
+                    auto known = db.find(origin);
+                    bool newer = (known == db.end() || seq > known->second.seq);
+                    if (newer) {
+                        bool topology_changed =
+                            (known == db.end() || known->second.links != links);
+                        db[origin] = {seq, links, Clock::now()};
+
+                        // Forward to every neighbour except the one that sent it
+                        // and the node that originated it.
+                        char sender = 0;
+                        char sender_ip[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET, &from.sin_addr, sender_ip, sizeof(sender_ip));
+                        uint16_t sender_port = ntohs(from.sin_port);
+                        for (const auto &[letter, info] : neighbours)
+                            if (info.cost != 0 && info.ip == sender_ip &&
+                                info.port == sender_port) {
+                                sender = letter;
+                                break;
+                            }
+
+                        auto targets = neighbours;
+                        targets.erase(sender);
+                        targets.erase(origin);
+                        targets.erase(self);
+                        flood(udp_fd, origin, seq, links, targets);
+
+                        if (topology_changed)
+                            recompute("LSP from a remote node");
+                    } else if (known != db.end() && seq == known->second.seq) {
+                        known->second.heard = Clock::now(); // still alive
                     }
                 }
-                if (sender == 0)
-                    continue;
-                map<char, tuple<string, uint16_t, int>> flood_to = neighbors;
-                flood_to.erase(sender);
-                flood_to.erase(origin);
-                flood_to.erase(vn_alphabet); // self
-                send_lsp(udp_fd, origin, seq, origin_links, flood_to);
             }
+        }
+
+        // ---- periodic work
+        auto now = Clock::now();
+
+        if (self != 0 && now - last_advert >= kLspPeriod) {
+            last_advert = now;
+            auto it = db.find(self);
+            if (it != db.end()) {
+                it->second.seq = ++own_seq;
+                it->second.heard = now;
+                flood(udp_fd, self, own_seq, it->second.links, neighbours);
+            }
+        }
+
+        // A node whose LSP has not been refreshed is gone, and so is everything
+        // only reachable through it. This is what turns a silent link failure
+        // into a routing change.
+        std::vector<char> expired;
+        for (const auto &[origin, ls] : db)
+            if (origin != self && now - ls.heard > kLspTimeout)
+                expired.push_back(origin);
+        if (!expired.empty()) {
+            for (char origin : expired) {
+                std::cout << "[" << self << "] " << origin
+                          << " timed out, dropping its link state\n";
+                db.erase(origin);
+            }
+            recompute("neighbour timeout");
+        }
+
+        if (self != 0 && now - last_report >= kReportPeriod) {
+            last_report = now;
+            print_topology(db);
+            print_routes(self, routes);
         }
     }
 

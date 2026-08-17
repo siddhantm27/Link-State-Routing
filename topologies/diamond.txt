@@ -1,0 +1,6 @@
+# 4 nodes. A reaches D either via B (1+2 = 3) or via C (4+1 = 5), so the
+# shortest path is A->B->D. Cutting A-B should reroute A via C at cost 5.
+#     B   C   D
+1   4  -1     # A
+-1   2        # B
+1             # C

@@ -1,0 +1,5 @@
+# 3 nodes, fully connected. Row i gives costs from node i to nodes i+1..n-1.
+# -1 means no direct link.
+#     B  C
+2  7   # A
+5      # B

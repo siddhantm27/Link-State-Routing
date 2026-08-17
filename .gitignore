@@ -1,0 +1,3 @@
+vn
+*.o
+__pycache__/
